@@ -1,0 +1,834 @@
+---
+title: "Ensemble Techniques"
+output: word_document
+---
+
+An R implementation of the paper 'Key-Attributes-Based Ensemble Classifier for Customer Churn Prediction' by Yu Qian, Liang-Qiang Li, Jian-Rong Ran, and Pei-Ji Shao.
+
+
+Dependencies:
+```{r}
+library(plyr)
+library(dplyr)
+library(glmnet)
+library(pheatmap)
+library(tidyverse)  # data manipulation
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering visualization
+library(dendextend) # for comparing two dendrograms
+library(reticulate)
+library(coefplot)
+library(caTools)  #For sample.split
+library(rpart)  #For rpart function
+library(ROCR)
+library(caret)
+library(pROC)
+set.seed(7096)
+defaultW <- getOption("warn") 
+options(warn = -1) 
+
+```
+
+```{r}
+np<-import('numpy')
+skl <- import('sklearn')
+skc<- skl$cluster
+```
+
+
+
+Pre-defined functions:
+```{r}
+pcaCharts <- function(x) {
+    x.var <- x$sdev ^ 2
+    x.pvar <- x.var/sum(x.var)
+    print("proportions of variance:")
+    print(x.pvar)
+    
+    par(mfrow=c(2,2))
+    plot(x.pvar,xlab="Principal component", ylab="Proportion of variance explained", ylim=c(0,1), type='b')
+    plot(cumsum(x.pvar),xlab="Principal component", ylab="Cumulative Proportion of variance explained", ylim=c(0,1), type='b')
+    screeplot(x)
+    screeplot(x,type="l")
+    par(mfrow=c(1,1))
+}
+
+```
+
+
+
+Loading the data:
+
+```{r}
+setwd('C:/Users/SASWATA/Desktop/Study ebooks/Sem 6/CSE4029')
+
+dset<-read.csv("telecom_churn_data.csv")
+dset2<-read.csv('tele.csv')
+print('Dimensions of data:')
+dim(dset)
+print('Structure of data:')
+str(dset)
+```
+
+
+```{r}
+#Looking at NA values
+
+sumNA<-function(x){
+  return (sum(is.na(x)))
+}
+
+NAs.each.col<-apply(dset,2,sumNA)
+
+NAs.each.col
+summary(NAs.each.col)
+
+```
+
+We will not have to deal with all NA values because we are not concerned with all 100K customers, we will only consider the valuable customers. We will assume that customers with spending more than 70th percentile in the initial 2 months are valuable.
+
+Separating the HV customers:
+
+```{r}
+
+dset$tot_rech_amt_data_6<-dset$total_rech_data_6*dset$av_rech_amt_data_6
+dset$tot_rech_amt_data_7<-dset$total_rech_data_7*dset$av_rech_amt_data_7
+
+dset[is.na(dset$tot_rech_amt_data_6),'tot_rech_amt_data_6']<-0
+dset[is.na(dset$tot_rech_amt_data_7),'tot_rech_amt_data_7']<-0
+
+dset$tot_amt_6<-dset$tot_rech_amt_data_6+dset$total_rech_amt_6
+dset$tot_amt_7<-dset$tot_rech_amt_data_7+dset$total_rech_amt_7
+
+dset$avg_amt_6_7<-(dset$tot_amt_7+dset$tot_amt_6)/2
+q<-as.numeric(quantile(dset$avg_amt_6_7,probs=c(0.7),na.rm=TRUE))
+
+tele<- dset[dset$avg_amt_6_7>=q,]
+dim(tele)
+
+
+```
+
+
+Removing redundat Columns:
+```{r}
+
+tele<-tele %>% select(-c('tot_rech_amt_data_6','tot_rech_amt_data_7'))
+
+```
+
+
+Our dataset does not have customers tagged as churn/not churn by default. therefore we need to infer the churn tag. 1 means churned and 0 means no churn.
+
+```{r}
+
+tele$churn_p<-tele$total_ic_mou_9+tele$total_og_mou_9+tele$vol_2g_mb_9+tele$vol_3g_mb_9
+
+tele$churn<-ifelse(tele$churn_p==0,yes=1,no=0)
+
+tele<-tele %>% select( -c( 'total_ic_mou_9', 'total_og_mou_9', 'vol_2g_mb_9', 'vol_3g_mb_9','churn_p' ) )
+
+churn.stat<-plyr::count(tele$Churn)
+churn.stat$perc<-(churn.stat$freq/dim(tele)[1])*100
+
+sp3<- sample.split(dset2, SplitRatio = 0.8)
+tele <- subset(dset2, sp3 == "TRUE")
+telet <- subset(dset2, sp3 == "FALSE")
+
+churn.stat
+
+```
+
+Further, we need to impute the columns with missing values and remove redundant columns to get the clean dataset. We need to convert the categorical features into numerical and treat the skewness of each feature as well. The output will be the final dataset.
+
+Searching for Key Attributes:
+
+```{r}
+#1. Using LASSO
+
+X<-tele %>% select(-c("churn"))
+Y<-tele[,"churn"]
+
+x<-tele
+
+cvfit <- glmnet::cv.glmnet(as.matrix(X), Y)
+feat.order <- coef(cvfit, s = "lambda.1se")
+
+coefplot(cvfit,lambda='lambda.1se', sort='magnitude')
+
+
+```
+
+```{r}
+tele$index<-seq.int(nrow(tele))
+s0<-tele[tele$index%in%sample(tele[tele$churn==0,'index'],size=500,replace=FALSE),c(1:50)]
+s1<-tele[tele$index%in%sample(tele[tele$churn==1,'index'],size=500,replace=FALSE),c(1:50)]
+small<-rbind(s0,s1)
+
+dim(small)
+pheatmap(small, cutree_rows = 6)
+
+d <- dist(small, method = "euclidean")
+
+# Hierarchical clustering using Complete Linkage
+hc1 <- hclust(d, method = "complete" )
+plot(hc1, cex = 0.6, hang = -1)
+
+```
+
+```{r}
+#C:/Users/SASWATA/AppData/Local/r-miniconda/envs/r-reticulate/python.exe -m pip install scikit-learn
+
+agglo<-skc$FeatureAgglomeration(n_clusters=as.integer(4))
+agglo$fit(tele%>%select(-c('index','churn')))
+
+small.re<-agglo$transform(tele%>%select(-c('index','churn')))
+small.red<-as.data.frame(small.re)
+small.red$churn<-tele$churn
+small.red$index<-seq.int(nrow(tele))
+
+inv.red<-agglo$inverse_transform(small.re)
+
+comp<-tele%>%select(-c('index','churn'))
+
+
+
+```
+
+```{r}
+#Finalizing the clusters
+
+fvals<-c(small.red[1,1],small.red[1,2],small.red[1,3],small.red[1,4])
+comp.names<-make.names(names(comp))
+cl1<-c()
+cl2<-c()
+cl3<-c()
+cl4<-c()
+
+
+for (i in 1:205){
+  if(inv.red[1,i]==fvals[1]){
+    cl1<-append(cl1,comp.names[i])
+  }
+  
+  if(inv.red[1,i]==fvals[2]){
+    cl2<-append(cl2,comp.names[i])
+  }
+  
+  if(inv.red[1,i]==fvals[3]){
+    cl3<-append(cl3,comp.names[i])
+  }
+  
+  if(inv.red[1,i]==fvals[4]){
+    cl4<-append(cl4,comp.names[i])
+  }
+  
+}
+
+length(cl1)
+length(cl2)
+length(cl3)
+length(cl4)
+
+#The 4 clusters based on attributes are:
+
+tele.c1<- tele %>% select(c(cl1,"churn","index"))
+tele.c2<- tele %>% select(c(cl2,"churn","index"))
+tele.c3<- tele %>% select(c(cl3,"churn","index"))
+tele.c4<- tele %>% select(c(cl4,"churn","index"))
+
+```
+
+
+
+The dataset small.red has 4 variables and 23885 observations. These 4 variables are going to be our key attributes. Now, we will use SVD to create subsets based on our Key Attributes.
+
+
+```{r}
+#Applying SVD to each cluster
+
+c1.svd<- svd(tele.c1 %>% select(-c("churn","index")),nu=2)
+#c1.svd$u
+
+c2.svd<- svd(tele.c2 %>% select(-c("churn","index")),nu=2)
+#c2.svd$u
+
+c3.svd<- svd(tele.c3 %>% select(-c("churn","index")),nu=2)
+#c3.svd$u
+
+c4.svd<- svd(tele.c4 %>% select(-c("churn","index")),nu=2)
+#c4.svd$u
+
+```
+
+
+```{r}
+#Splitting cluster 1
+
+c1.km<- kmeans(c1.svd$u,centers=3,nstart = 25)
+c1.lables<-c1.km$cluster
+
+tele.c1.1<-data.frame()
+
+tele.c1.2<-data.frame()
+
+tele.c1.3<-data.frame()
+
+for (i in 1:23885){
+  if (c1.lables[i]==1){
+    tele.c1.1<-rbind(tele.c1.1,tele.c1[i,])
+  } else if (c1.lables[i]==2){
+    tele.c1.2<-rbind(tele.c1.2,tele.c1[i,])
+  } else {
+    tele.c1.3<-rbind(tele.c1.3,tele.c1[i,])
+  }
+}
+
+dim(tele.c1.1)
+dim(tele.c1.2)
+dim(tele.c1.3)
+
+```
+
+
+```{r}
+#Splitting cluster 2
+
+c2.km<- kmeans(c2.svd$u,centers=3,nstart = 25)
+c2.lables<-c2.km$cluster
+
+tele.c2.1<-data.frame()
+
+tele.c2.2<-data.frame()
+
+tele.c2.3<-data.frame()
+
+for (i in 1:23885){
+  if (c2.lables[i]==1){
+    tele.c2.1<-rbind(tele.c2.1,tele.c2[i,])
+  } else if (c2.lables[i]==2){
+    tele.c2.2<-rbind(tele.c2.2,tele.c2[i,])
+  } else {
+    tele.c2.3<-rbind(tele.c2.3,tele.c2[i,])
+  }
+}
+
+dim(tele.c2.1)
+dim(tele.c2.2)
+dim(tele.c2.3)
+
+```
+
+
+```{r}
+#Splitting cluster 3
+
+c3.km<- kmeans(c3.svd$u,centers=3,nstart = 25)
+c3.lables<-c3.km$cluster
+
+tele.c3.1<-data.frame()
+
+tele.c3.2<-data.frame()
+
+tele.c3.3<-data.frame()
+
+for (i in 1:23885){
+  if (c3.lables[i]==1){
+    tele.c3.1<-rbind(tele.c3.1,tele.c3[i,])
+  } else if (c3.lables[i]==2){
+    tele.c3.2<-rbind(tele.c3.2,tele.c3[i,])
+  } else {
+    tele.c3.3<-rbind(tele.c3.3,tele.c3[i,])
+  }
+}
+
+dim(tele.c3.1)
+dim(tele.c3.2)
+dim(tele.c3.3)
+
+```
+
+
+
+```{r}
+#Splitting Cluster 4
+
+c4.km<- kmeans(c4.svd$u,centers=3,nstart = 25)
+c4.lables<-c4.km$cluster
+
+tele.c4.1<-data.frame()
+
+tele.c4.2<-data.frame()
+
+tele.c4.3<-data.frame()
+
+for (i in 1:23885){
+  if (c4.lables[i]==1){
+    tele.c4.1<-rbind(tele.c4.1,tele.c4[i,])
+  } else if (c4.lables[i]==2){
+    tele.c4.2<-rbind(tele.c4.2,tele.c4[i,])
+  } else {
+    tele.c4.3<-rbind(tele.c4.3,tele.c4[i,])
+  }
+}
+
+dim(tele.c4.1)
+dim(tele.c4.2)
+dim(tele.c4.3)
+
+```
+
+Now, we will split each subset into train and test sets and construct four models to train with these subsets which will lead to ultimately choosing the best fit model for each key attribute subset.
+
+Train-Test Split:
+```{r}
+#Subsets of Cluster 1
+
+s0 <- sample.split(tele.c1.1, SplitRatio = 0.7)
+tele.c1.1.train <- subset(tele.c1.1, s0 == "TRUE")
+tele.c1.1.test <- subset(tele.c1.1, s0 == "FALSE")
+
+s1 <- sample.split(tele.c1.2, SplitRatio = 0.7)
+tele.c1.2.train <- subset(tele.c1.2, s1 == "TRUE")
+tele.c1.2.test <- subset(tele.c1.2, s1 == "FALSE")
+
+s2 <- sample.split(tele.c1.3, SplitRatio = 0.7)
+tele.c1.3.train <- subset(tele.c1.3, s2 == "TRUE")
+tele.c1.3.test <- subset(tele.c1.3, s2 == "FALSE")
+
+```
+
+```{r}
+#Subsets of Cluster 2
+
+s3 <- sample.split(tele.c2.1, SplitRatio = 0.7)
+tele.c2.1.train <- subset(tele.c2.1, s3 == "TRUE")
+tele.c2.1.test <- subset(tele.c2.1, s3 == "FALSE")
+
+s4 <- sample.split(tele.c2.2, SplitRatio = 0.7)
+tele.c2.2.train <- subset(tele.c2.2, s4 == "TRUE")
+tele.c2.2.test <- subset(tele.c2.2, s4 == "FALSE")
+
+s5 <- sample.split(tele.c2.3, SplitRatio = 0.7)
+tele.c2.3.train <- subset(tele.c2.3, s5 == "TRUE")
+tele.c2.3.test <- subset(tele.c2.3, s5 == "FALSE")
+
+```
+
+```{r}
+#Subsets of Cluster 3
+
+s6 <- sample.split(tele.c3.1, SplitRatio = 0.7)
+tele.c3.1.train <- subset(tele.c3.1, s6 == "TRUE")
+tele.c3.1.test <- subset(tele.c3.1, s6 == "FALSE")
+
+s7 <- sample.split(tele.c3.2, SplitRatio = 0.7)
+tele.c3.2.train <- subset(tele.c3.2, s7 == "TRUE")
+tele.c3.2.test <- subset(tele.c3.2, s7 == "FALSE")
+
+s8 <- sample.split(tele.c3.3, SplitRatio = 0.7)
+tele.c3.3.train <- subset(tele.c3.3, s8 == "TRUE")
+tele.c3.3.test <- subset(tele.c3.3, s8 == "FALSE")
+
+```
+
+```{r}
+#Subsets of Cluster 4
+
+s9 <- sample.split(tele.c4.1, SplitRatio = 0.7)
+tele.c4.1.train <- subset(tele.c4.1, s9 == "TRUE")
+tele.c4.1.test <- subset(tele.c4.1, s9 == "FALSE")
+
+s10 <- sample.split(tele.c4.2, SplitRatio = 0.7)
+tele.c4.2.train <- subset(tele.c4.2, s10 == "TRUE")
+tele.c4.2.test <- subset(tele.c4.2, s10 == "FALSE")
+
+s11 <- sample.split(tele.c4.3, SplitRatio = 0.7)
+tele.c4.3.train <- subset(tele.c4.3, s11 == "TRUE")
+tele.c4.3.test <- subset(tele.c4.3, s11 == "FALSE")
+
+```
+
+
+Model Construction:
+```{r}
+svM<-function(train,test,Y,ytest,i=1){
+  r<-plyr::count(Y)[1,2]/plyr::count(Y)[2,2]
+  wt<-table(Y)
+  wt[1]<-1
+  wt[2]<-1/r
+  
+  Y<-factor(Y,levels = unique(Y))
+  ytest<-factor(ytest,levels = unique(Y))
+  if (i!=1){
+  ytest<-factor(ytest,levels = rev(unique(ytest)))
+  } #else {
+  #   ytest<-factor(ytest,levels = unique(ytest))
+  # }
+  
+  
+  tmp.mod<-e1071::svm(x=as.matrix(train),y=Y,type="C-classification",kernel="radial",class.weights=wt,cross=2)
+  
+  tmp.pred<-predict(tmp.mod,newdata= as.matrix(test))
+  if (length(unique(tmp.pred))==1){
+    tmp.pred[length(tmp.pred)]<-ifelse(unique(tmp.pred)==0,yes=1,no=0)
+  }
+  ptr<-predict(tmp.mod,newdata= as.matrix(train))
+  
+  
+  c<-confusionMatrix( table( tmp.pred, ytest ) )
+  
+  print(c)
+  
+  par(pty="s")
+  tmp <- roc(ytest ~ as.numeric(tmp.pred),plot=TRUE,print.auc=TRUE,col="red",lwd =2,legacy.axes=TRUE,main="Test")
+  tmp1 <- roc(Y ~ as.numeric(ptr),plot=TRUE,print.auc=TRUE,col="blue",lwd =2,legacy.axes=TRUE,main="Train")
+  
+  auc<-pROC::auc(tmp)
+  
+  return (list(tmp.mod,auc))
+}
+
+```
+
+```{r}
+logiR<-function(train,test,Y,ytest,i=1,t=2){
+  # r<-plyr::count(Y)[1,2]/plyr::count(Y)[2,2]
+  # wt<-table(Y)
+  # wt[1]<-1
+  # wt[2]<-1/r
+  
+  Y<-factor(Y,levels = unique(Y))
+  ytest<-factor(ytest,levels = unique(Y))
+  if (i!=1){
+  ytest<-factor(ytest,levels = rev(unique(Y)))#ytest)))
+  }# else {
+  #   ytest<-factor(ytest,levels = unique(ytest))
+  # }
+  
+  
+  tmp.mod<-glm(Y~.,data=train, family=binomial)
+  
+  tmp.in<-predict(tmp.mod,newdata= test)
+  if (s=='neg'){
+    tmp.in<-tmp.in*(-1)
+  }
+  tmp.pred<-ifelse(tmp.in<t,yes=1,no=0)
+  
+  #print(ytest)
+  #print(tmp.in)
+  
+  
+  if (length(unique(tmp.pred))==1){
+    tmp.pred[length(tmp.pred)]<-ifelse(unique(tmp.pred)==0,yes=1,no=0)
+  }
+  tmp.pred<-factor(tmp.pred,levels = rev(unique(tmp.pred)))
+  
+  
+  ptr.in<-predict(tmp.mod,newdata= train)
+  ptr<-ifelse(ptr.in<t,yes=1,no=0)
+  
+  #print(unique(tmp.pred))
+  #print(unique(ytest))
+  c<-confusionMatrix( table( tmp.pred, ytest ) )
+  
+  print(c)
+  
+  par(pty="s")
+  tmp <- roc(ytest ~ as.numeric(tmp.pred),plot=TRUE,print.auc=TRUE,col="red",lwd =2,legacy.axes=TRUE,main="Test")
+  tmp1 <- roc(Y ~ as.numeric(ptr),plot=TRUE,print.auc=TRUE,col="blue",lwd =2,legacy.axes=TRUE,main="Train")
+  
+  auc<-pROC::auc(tmp)
+  
+  return (list(tmp.mod,auc,t))
+}
+
+```
+
+```{r}
+dTree<-function(train,test,y,ytest,t=0.5){
+  
+  tmp.mod<-rpart::rpart(y~.,data=train,method='class')
+  
+  tmp.in<-predict(tmp.mod,newdata= test)
+  tmp.pred<-ifelse(tmp.in[,2]>0.2,yes=1,no=0)
+  if (length(unique(tmp.pred))==1){
+    tmp.pred[length(tmp.pred)]<-ifelse(unique(tmp.pred)==0,yes=1,no=0)
+  }
+  
+  #print(ytest)
+  #print(tmp.in)
+  
+  
+  ptr.in<-predict(tmp.mod,newdata= train)
+  #print(class(ptr.in))
+  ptr<-ifelse(ptr.in[,2]>t,yes=1,no=0)
+  
+  # print(tmp.pred)
+  # print(class(tmp.pred))
+  # print(dim(tmp.pred))
+  # print(length(tmp.pred))
+  # print(unique(tmp.pred))
+  # print(length(ytest))
+  
+  u <- union(tmp.pred,ytest)
+  
+  c<-confusionMatrix( table( tmp.pred, ytest ) )
+  
+  print(c)
+  
+  par(pty="s")
+  tmp <- roc(ytest ~ as.numeric(tmp.pred),plot=TRUE,print.auc=TRUE,col="red",lwd =2,legacy.axes=TRUE,main="Test")
+  tmp1 <- roc(y ~ as.numeric(ptr),plot=TRUE,print.auc=TRUE,col="blue",lwd =2,legacy.axes=TRUE,main="Train")
+  
+  auc<-pROC::auc(tmp)
+  
+  return (list(tmp.mod,auc,t))
+}
+
+```
+
+Fitting all the models on each of the sub-datasets to get the best fit for each subset of each feature.
+
+Training routine per sub dataset:
+```{r}
+subTrain<-function(sdtr,sdte,i=1,lt=2,td=0.5,ls='pos',si=1,li=1){
+  sv<-svM(sdtr %>% select(-c("index","churn")), sdte %>% select(-c("index","churn")), sdtr$churn, sdte$churn,si)
+  lr<-logiR(sdtr %>% select(-c("index","churn")), sdte %>% select(-c("index","churn")), sdtr$churn, sdte$churn,t=lt,i=li)
+  dt<-dTree(sdtr %>% select(-c("index","churn")), sdte %>% select(-c("index","churn")), sdtr$churn, sdte$churn,t=td)
+  
+  
+  return (list(sv,lr,dt))
+}
+```
+
+```{r}
+#Multiply the best model by 2 and everything by 10
+rate<-function(l){
+  max<- -1
+  for (i in 1:3){
+    
+    if (unlist(l[[i]][2])>max){
+      max<-unlist(l[[i]][2])
+    }
+  }
+  for (i in 1:3){
+    if (unlist(l[[i]][2]==max)){
+      l[[i]][2]<-2*max
+      if(i==1)
+        print("Best model is SVM")
+      else if (i==2)
+        print("Best model is LR")
+      else
+        print("Best model is DT")
+    }
+  }
+  return (l)
+}
+```
+
+Cluster 1:
+```{r}
+#Cluster 1, subset 1
+
+c1s1<-subTrain(tele.c1.1.train,tele.c1.1.test)
+c1s1<-rate(c1s1)
+```
+
+```{r}
+#Cluster 1, subset 2
+
+c1s2<-subTrain(tele.c1.2.train,tele.c1.2.test)
+c1s2<-rate(c1s2)
+```
+
+```{r}
+#Cluster 1, subset 3
+
+c1s3<-subTrain(tele.c1.3.train,tele.c1.3.test,li=0)
+c1s3<-rate(c1s3)
+```
+
+Cluster 2:
+
+```{r}
+#Cluster 2, subset 1
+
+c2s1<-subTrain(tele.c2.1.train,tele.c2.1.test)
+c2s1<-rate(c2s1)
+```
+
+```{r}
+#Cluster 2, subset 2
+
+c2s2<-subTrain(tele.c2.2.train,tele.c2.2.test)
+c2s2<-rate(c2s2)
+```
+
+```{r}
+#Cluster 2, subset 3
+
+c2s3<-subTrain(tele.c2.3.train,tele.c2.3.test,li=0)
+c2s3<-rate(c2s3)
+```
+
+Cluster 3:
+
+```{r}
+#Cluster 3, subset 1
+
+c3s1<-subTrain(tele.c3.1.train,tele.c3.1.test)
+c3s1<-rate(c3s1)
+```
+
+```{r}
+#Cluster 3, subset 2
+
+c3s2<-subTrain(tele.c3.2.train,tele.c3.2.test)
+c3s2<-rate(c3s2)
+```
+
+```{r}
+#Cluster 3, subset 3
+
+c3s3<-subTrain(tele.c3.3.train,tele.c3.3.test)
+c3s3<-rate(c3s3)
+```
+
+
+Cluster 4:
+```{r}
+#Cluster 4, subset 1
+
+c4s1<-subTrain(tele.c4.1.train,tele.c4.1.test)
+c4s1<-rate(c4s1)
+```
+
+```{r}
+#Cluster 4, subset 2
+
+c4s2<-subTrain(tele.c4.2.train,tele.c4.2.test)
+c4s2<-rate(c4s2)
+```
+
+```{r}
+#Cluster 4, subset 3
+
+c4s3<-subTrain(tele.c4.3.train,tele.c4.3.test)
+c4s3<-rate(c4s3)
+```
+
+Creating prediction pipelines:
+
+```{r}
+pipe<-function(part,out,cnsn){
+  pipo<-c()
+  lt<-unlist(cnsn[[2]][3])
+  td<-unlist(cnsn[[3]][3])
+  sv<-predict(cnsn[[1]][1],newdata=part)
+  lr.in<-predict(cnsn[[2]][1],newdata=part)
+  dt.in<-predict(cnsn[[3]][1],newdata=part)
+  lr<-ifelse(unlist(lr.in)<lt,yes=1,no=0)#LR
+  dt<-ifelse(unlist(dt.in)[2]>td,yes=1,no=0)#DT
+  
+  for (i in 1:floor(unlist(cnsn[[1]][2])*10)){
+    pipo<-append(pipo,sv)
+  }
+  for (i in 1:floor(unlist(cnsn[[2]][2])*10)){
+    pipo<-append(pipo,lr)
+  }
+  for (i in 1:floor(unlist(cnsn[[3]][2])*10)){
+    pipo<-append(pipo,dt)
+  }
+  out<-append(out,pipo)
+  return (out)
+}
+```
+
+
+```{r}
+
+part1<-list(c1s1,c1s2,c1s3)
+part2<-list(c2s1,c2s2,c2s3)
+part3<-list(c3s1,c3s2,c3s3)
+part4<-list(c4s1,c4s2,c4s3)
+
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+```
+
+
+```{r}
+ensemble.mod<-function(newY){
+  out<-c()
+  newY.1<-newY %>% select(c(cl1))
+  newY.2<-newY %>% select(c(cl2))
+  newY.3<-newY %>% select(c(cl3))
+  
+  for(i in part1){
+    out<-pipe(newY.1,out,i)
+  }
+  for(i in part2){
+    out<-pipe(newY.2,out,i)
+  }
+  for(i in part3){
+    out<-pipe(newY.3,out,i)
+  }
+  
+  final<-getmode(out)
+  return (final)
+}
+```
+
+```{r}
+
+ensemble.mod.lot<-function(dataset){
+  r<-dim(dataset)[1]
+  allout<-c()
+  for(i in 1:r){
+    allout<-append(allout,ensemble.mod(dataset[i,]))
+  }
+  
+  return (allout)
+}
+
+```
+
+
+Prediction on the whole test set using the Ensemble classifier.
+
+```{r}
+lables<-telet$churn
+preds<-ensemble.mod.lot(telet)
+preds<-unlist(preds)
+confusionMatrix(table(preds,lables))
+```
+
+
+Prediction on a balanced sub-set of the test set using the Ensemble classifier.
+
+```{r}
+
+telet$index<-seq.int(nrow(telet))
+telet1<-telet[telet$churn==1,]
+dim(telet1)
+
+telet0<-telet[telet$index %in% sample(telet[telet$churn==0,"index"],size=529),]
+telett<-rbind(telet0,telet1)
+
+```
+
+```{r}
+lablest<-telett$churn
+predst<-ensemble.mod.lot(telett)
+predst<-unlist(predst)
+confusionMatrix(table(predst,lablest))
+```
+
+```{r}
+options(warn = defaultW)
+```
+
